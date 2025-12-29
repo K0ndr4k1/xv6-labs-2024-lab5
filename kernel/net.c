@@ -37,8 +37,29 @@ sys_bind(void)
   //
   // Your code here.
   //
+int port;
+  struct proc *p = myproc();
 
-  return -1;
+  // 1. 获取系统调用参数 (int port)
+  if(argint(0, &port) < 0)
+    return -1;
+
+  // 2. 查找一个空闲的 socket 位置，并绑定端口
+  // 注意：这里需要简单的锁机制来防止竞态
+  for(int i = 0; i < NSOCK; i++) {
+    acquire(&sockets[i].lock);
+    if(sockets[i].valid == 0) {
+      sockets[i].port = port;
+      sockets[i].valid = 1;
+      sockets[i].rxq = 0; // 队列清空
+      release(&sockets[i].lock);
+      return 0;
+    }
+    release(&sockets[i].lock);
+  }
+
+  return -1; // 没有空闲 socket
+  
 }
 
 //
@@ -77,7 +98,78 @@ sys_recv(void)
   //
   // Your code here.
   //
-  return -1;
+  //int dport; // 目标端口
+  uint64 src_ip_addr; // 用户态指针：存源IP
+  uint64 src_port_addr; // 用户态指针：存源端口
+  uint64 buf_addr; // 用户态指针：存数据
+  int maxlen;
+
+  // 获取参数
+  if(argint(0, &dport) < 0 || argaddr(1, &src_ip_addr) < 0 ||
+     argaddr(2, &src_port_addr) < 0 || argaddr(3, &buf_addr) < 0 ||
+     argint(4, &maxlen) < 0)
+    return -1;
+
+  // 寻找对应的 socket
+  int i;
+  int index = -1;
+  for(i = 0; i < NSOCK; i++){
+    acquire(&sockets[i].lock);
+    if(sockets[i].valid && sockets[i].port == dport){
+      index = i;
+      // 保持持有锁，进入循环
+      break;
+    }
+    release(&sockets[i].lock);
+  }
+
+  if(index == -1) return -1; // 端口未绑定
+
+  struct sock *s = &sockets[index];
+
+  // 循环等待数据
+  while(s->rxq == 0){
+    // 如果没有数据，进入睡眠，释放锁
+    sleep(s, &s->lock);
+    // 醒来后重新持有锁，再次检查
+    if(myproc()->killed){
+      release(&s->lock);
+      return -1;
+    }
+  }
+
+  // 取出队列头的包
+  struct mbuf *m = s->rxq;
+  s->rxq = m->next;
+  release(&s->lock); // 数据取出来了，可以放锁了
+
+  // 提取包里的信息 (注意：m->head 现在指向 Payload)
+  // 但是我们需要 IP 和 UDP 头里的源地址信息
+  // 这里的难点是：我们在 ip_rx 里已经 mbufpull 过了，头信息“丢”了吗？
+  // 答：mbufpull 只是移动 head 指针。IP/UDP 头还在 m->head 的前面内存里。
+  // 我们需要倒推回去找 header。
+
+  // 恢复 UDP 头指针
+  struct udp *udph = (struct udp *)(m->head - sizeof(struct udp));
+  // 恢复 IP 头指针
+  struct ip *iph = (struct ip *)(m->head - sizeof(struct udp) - sizeof(struct ip));
+
+  uint32 src_ip = ntohl(iph->ip_src);
+  uint16 src_port = ntohs(udph->sport);
+  int len = m->len;
+  if(len > maxlen) len = maxlen;
+
+  // 拷贝数据到用户空间
+  if(copyout(myproc()->pagetable, src_ip_addr, (char*)&src_ip, sizeof(src_ip)) < 0 ||
+     copyout(myproc()->pagetable, src_port_addr, (char*)&src_port, sizeof(src_port)) < 0 ||
+     copyout(myproc()->pagetable, buf_addr, m->head, len) < 0){
+       mbuffree(m);
+       return -1;
+  }
+
+  mbuffree(m); // 释放内核 buffer
+  return len; // 返回读取的字节数
+  
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -191,7 +283,72 @@ ip_rx(char *buf, int len)
   //
   // Your code here.
   //
-  
+ if(len < sizeof(struct eth) + sizeof(struct ip)) {
+    kfree(buf);
+    return;
+  }
+
+  struct ip *ip = (struct ip*)(buf + sizeof(struct eth));
+
+  // Verify IP Checksum
+  if(in_cksum((unsigned char*)ip, sizeof(struct ip)) != 0) {
+    kfree(buf);
+    return;
+  }
+
+  // Check if it is UDP
+  if(ip->ip_p != IPPROTO_UDP) {
+    kfree(buf);
+    return;
+  }
+
+  // Check buffer length validity for UDP header
+  if(len < sizeof(struct eth) + sizeof(struct ip) + sizeof(struct udp)) {
+    kfree(buf);
+    return;
+  }
+
+  struct udp *udp = (struct udp*)(ip + 1);
+  uint16 dport = ntohs(udp->dport);
+
+  // Find destination socket
+  struct sock *s = 0;
+  acquire(&netlock);
+  for(int i = 0; i < NSOCK; i++) {
+    if(sockets[i].port == dport) {
+      s = &sockets[i];
+      acquire(&s->lock);
+      break;
+    }
+  }
+  release(&netlock);
+
+  // If socket found, enqueue the packet
+  if(s) {
+    struct rx_entry *e = (struct rx_entry*)kalloc();
+    if(e == 0) {
+      release(&s->lock);
+      kfree(buf);
+      return;
+    }
+    
+    e->buf = buf;
+    e->len = len;
+    e->next = 0;
+
+    if(s->rx_tail) {
+      s->rx_tail->next = e;
+    } else {
+      s->rx_head = e;
+    }
+    s->rx_tail = e;
+    
+    wakeup(s); // Wake up sys_recv
+    release(&s->lock);
+  } else {
+    // No socket bound to this port, drop packet
+    kfree(buf);
+  } 
 }
 
 //
