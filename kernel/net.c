@@ -95,10 +95,7 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  //int dport; // 目标端口
+   // 目标端口
   uint64 src_ip_addr; // 用户态指针：存源IP
   uint64 src_port_addr; // 用户态指针：存源端口
   uint64 buf_addr; // 用户态指针：存数据
